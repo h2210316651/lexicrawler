@@ -51,21 +51,8 @@ Ready to unleash LexiCrawler? Follow these simple steps:
 
 *   **Go Installation:** Ensure you have Go installed on your system. Download from [https://go.dev/dl/](https://go.dev/dl/).
 
-### Installation
 
-1.  **Get the package:**
-
-    ```bash
-    go get -u -v github.com/h2210316651/lexicrawler
-    ```
-
-2.  **Navigate to the project directory:**
-
-    ```bash
-    cd $GOPATH/src/github.com/h2210316651/lexicrawler # Or wherever your Go projects are located
-    ```
-
-3.  **Run the API:**
+*   **Run the API:**
 
     ```bash
     go run main.go
