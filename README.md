@@ -196,7 +196,7 @@ LexiCrawler is released under the [MIT License](LICENSE).  Feel free to use, mod
 
 ---
 
-##  Author & Maintainer (Optional)
+##  Author & Maintainer
 
 [Srinath Pulaverthi](https://github.com/h2210316651)
 
