@@ -16,7 +16,8 @@ import (
 	"github.com/gocolly/colly/v2"
 	"github.com/gofiber/fiber/v2"
 	fiberlog "github.com/gofiber/fiber/v2/log"
-	"github.com/go-shiori/go-readability" 
+	"github.com/go-shiori/go-readability"
+	"golang.org/x/net/html" // For explicit UTF-8 parsing
 )
 
 // CrawlerConfig, CrawledData, Crawler, NewCrawler, Crawl, getCachedData, cacheData, fetchDynamicContent, captureScreenshot, generateMarkdown, parseSrcset, resolveURL, applyHeuristics - remain the same
@@ -37,12 +38,12 @@ type CrawlerConfig struct {
 
 // CrawledData stores the extracted information for a URL
 type CrawledData struct {
-	URL         string
-	Markdown      string
-	StructuredData map[string]interface{}
-	Metadata      map[string]string
-	ScreenshotPath string
-	RawHTML       string // Optional: For raw data crawling
+	URL            string
+	Markdown         string
+	StructuredData   map[string]interface{}
+	Metadata         map[string]string
+	ScreenshotPath   string
+	RawHTML          string // Optional: For raw data crawling
 }
 
 // Crawler struct
@@ -72,6 +73,7 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 		colly.MaxDepth(c.Config.MaxDepth),
 		colly.Async(),
 		colly.CacheDir("./.crawler_cache"),
+		colly.DetectCharset(), // Re-enable charset detection - IMPORTANT
 	)
 
 	collector.OnRequest(func(r *colly.Request) {
@@ -103,7 +105,6 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 		}
 
 		var doc *goquery.Document
-		var err error // Declare err here
 
 		if c.Config.EnableJS {
 			dynamicContent, err := c.fetchDynamicContent(currentURL)
@@ -112,18 +113,27 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 				return
 			}
 			crawledData.RawHTML = dynamicContent
-			doc, err = goquery.NewDocumentFromReader(strings.NewReader(dynamicContent))
+			htmlContentUTF8 := dynamicContent // dynamicContent should already be UTF-8 from fetchDynamicContent
+
+			// Explicitly parse dynamic content as UTF-8 using x/net/html
+			htmlDoc, err := html.Parse(strings.NewReader(htmlContentUTF8))
 			if err != nil {
-				log.Printf("Error parsing dynamic HTML for %s: %v", currentURL, err)
+				log.Printf("Error parsing dynamic HTML as UTF-8 for %s: %v", currentURL, err)
 				return
 			}
+			doc = goquery.NewDocumentFromNode(htmlDoc)
+
 		} else {
-			crawledData.RawHTML = string(e.Response.Body)
-			doc, err = goquery.NewDocumentFromReader(strings.NewReader(crawledData.RawHTML))
+			htmlContentUTF8 := string(e.Response.Body)
+			crawledData.RawHTML = htmlContentUTF8
+
+			// Explicitly parse static content as UTF-8 using x/net/html
+			htmlDoc, err := html.Parse(strings.NewReader(htmlContentUTF8))
 			if err != nil {
-				log.Printf("Error parsing static HTML for %s: %v", currentURL, err)
+				log.Printf("Error parsing static HTML as UTF-8 for %s: %v", currentURL, err)
 				return
 			}
+			doc = goquery.NewDocumentFromNode(htmlDoc)
 		}
 
 		// --- Readability Integration using go-shiori/go-readability ---
@@ -134,12 +144,12 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 				log.Printf("Readability failed for %s: %v. Using raw HTML.", currentURL, err)
 				e.DOM = doc.Selection // Fallback to original doc
 			} else {
-				readabilityDoc, err := goquery.NewDocumentFromReader(strings.NewReader(article.Content))
+				readabilityHTMLDoc, err := html.Parse(strings.NewReader(article.Content))
 				if err != nil {
-					log.Printf("Error parsing readability output for %s: %v. Using raw HTML.", currentURL, err)
-					e.DOM = doc.Selection // Fallback if parsing readability output fails
+					log.Printf("Error parsing readability HTML as UTF-8 for %s: %v. Using raw HTML.", currentURL, err)
+					e.DOM = doc.Selection
 				} else {
-					e.DOM = readabilityDoc.Selection // Use readability's cleaned content
+					e.DOM = goquery.NewDocumentFromNode(readabilityHTMLDoc).Selection // Use readability's cleaned content
 					fmt.Println("Readability applied for:", currentURL)
 					crawledData.RawHTML = article.Content // Update RawHTML with cleaned content
 				}
@@ -148,13 +158,34 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 			e.DOM = doc.Selection // Use the document parsed from raw/dynamic HTML if readability is not enabled
 		}
 
+		// 1. Metadata Extraction (Enhanced and Corrected)
+		metadata := make(map[string]string) // Create a local metadata map
+		e.DOM.Find("meta").Each(func(_ int, s *goquery.Selection) {
+			nameAttr, nameExists := s.Attr("name")
+			propertyAttr, propertyExists := s.Attr("property")
+			contentAttr, contentExists := s.Attr("content")
 
-		// 1. Metadata Extraction (Basic)
-		crawledData.Metadata["title"] = e.DOM.Find("title").Text()
-		crawledData.Metadata["description"], _ = e.DOM.Find("meta[name=description]").Attr("content")
+			if contentExists {
+				if nameExists {
+					metadata[nameAttr] = contentAttr
+				} else if propertyExists {
+					metadata[propertyAttr] = contentAttr // property for OG and other semantic meta
+				}
+			}
+		})
+		metadata["title"] = e.DOM.Find("title").Text()
+		if canonicalURL, ok := e.DOM.Find("link[rel='canonical']").Attr("href"); ok {
+			metadata["canonical_url"] = e.Request.AbsoluteURL(canonicalURL)
+		}
+		if faviconURL, ok := e.DOM.Find("link[rel='icon']").Attr("href"); ok {
+			metadata["favicon_url"] = e.Request.AbsoluteURL(faviconURL)
+		} else if faviconURL, ok := e.DOM.Find("link[rel='shortcut icon']").Attr("href"); ok {
+			metadata["favicon_url"] = e.Request.AbsoluteURL(faviconURL)
+		}
+		crawledData.Metadata = metadata // Assign the populated metadata map
 
-		// 2. Markdown Generation
-		markdownContent, references := generateMarkdown(e.DOM, currentURL, c.Config)
+		// 2. Markdown Generation (Enhanced Table Support and Metadata)
+		markdownContent, references := generateMarkdown(e.DOM, currentURL, c.Config, crawledData.Metadata) // Pass metadata
 		crawledData.Markdown = markdownContent
 
 		if len(references) > 0 {
@@ -164,7 +195,7 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 			}
 		}
 
-		// 3. Structured Data Extraction (Example - Extracting blog post titles and links)
+		// 3. Structured Data Extraction (Example - Extracting blog post titles and links) - Keep Example
 		blogPosts := []map[string]string{}
 		e.DOM.Find(".card-body").Each(func(_ int, s *goquery.Selection) {
 			title := s.Find("h2.card-title a").Text()
@@ -198,9 +229,9 @@ func (c *Crawler) Crawl() (map[string]*CrawledData, error) {
 	return allCrawledData, nil
 }
 
-// getCachedData, cacheData, fetchDynamicContent, captureScreenshot, generateMarkdown, parseSrcset, resolveURL, applyHeuristics - remain the same
+// getCachedData, cacheData, fetchDynamicContent, captureScreenshot, parseSrcset, resolveURL, applyHeuristics - remain the same
 
-// ... (getCachedData, cacheData, fetchDynamicContent, captureScreenshot, generateMarkdown, parseSrcset, resolveURL, applyHeuristics functions are the same as before) ...
+// ... (getCachedData, cacheData, fetchDynamicContent, captureScreenshot, parseSrcset, resolveURL, applyHeuristics functions are the same as before) ...
 
 // getCachedData retrieves data from cache
 func (c *Crawler) getCachedData(urlStr string) *CrawledData {
@@ -261,15 +292,122 @@ func (c *Crawler) captureScreenshot(urlStr string) (string, error) {
 }
 
 // generateMarkdown converts HTML to Markdown
-func generateMarkdown(selection *goquery.Selection, baseURL string, config CrawlerConfig) (string, []string) {
+func generateMarkdown(selection *goquery.Selection, baseURL string, config CrawlerConfig, metadata map[string]string) (string, []string) { // Added metadata param
 	var markdownContent strings.Builder
 	var references []string
+
+	// Add Metadata at the beginning of Markdown
+	if title, ok := metadata["title"]; ok && title != "" {
+		markdownContent.WriteString("# " + title + "\n\n")
+	}
+	if description, ok := metadata["description"]; ok && description != "" {
+		markdownContent.WriteString("> " + description + "\n\n")
+	}
+	if keywords, ok := metadata["keywords"]; ok && keywords != "" {
+		markdownContent.WriteString("**Keywords:** " + keywords + "\n\n")
+	}
+	if author, ok := metadata["author"]; ok && author != "" {
+		markdownContent.WriteString("**Author:** " + author + "\n\n")
+	}
+	if canonicalURL, ok := metadata["canonical_url"]; ok && canonicalURL != "" {
+		markdownContent.WriteString("**Canonical URL:** " + canonicalURL + "\n\n")
+	}
+	markdownContent.WriteString("---\n\n") // Separator after metadata
 
 	selection.Find("nav, footer, script, style, noscript").Each(func(_ int, s *goquery.Selection) {
 		s.Remove()
 	})
 
-	selection.Find(".card-body").Each(func(_ int, cardBody *goquery.Selection) {
+	// Headers
+	selection.Find("h1").Each(func(_ int, s *goquery.Selection) { markdownContent.WriteString("# " + strings.TrimSpace(s.Text()) + "\n\n") })
+	selection.Find("h2").Each(func(_ int, s *goquery.Selection) { markdownContent.WriteString("## " + strings.TrimSpace(s.Text()) + "\n\n") })
+	selection.Find("h3").Each(func(_ int, s *goquery.Selection) { markdownContent.WriteString("### " + strings.TrimSpace(s.Text()) + "\n\n") })
+	selection.Find("h4").Each(func(_ int, s *goquery.Selection) { markdownContent.WriteString("#### " + strings.TrimSpace(s.Text()) + "\n\n") })
+	selection.Find("h5").Each(func(_ int, s *goquery.Selection) { markdownContent.WriteString("##### " + strings.TrimSpace(s.Text()) + "\n\n") })
+	selection.Find("h6").Each(func(_ int, s *goquery.Selection) { markdownContent.WriteString("###### " + strings.TrimSpace(s.Text()) + "\n\n") })
+
+	// Paragraphs
+	selection.Find("p").Each(func(_ int, p *goquery.Selection) {
+		paragraphText := strings.TrimSpace(p.Text())
+		if paragraphText != "" {
+			markdownContent.WriteString(paragraphText + "\n\n")
+		}
+	})
+
+	// Lists (Ordered and Unordered)
+	selection.Find("ul").Each(func(_ int, ul *goquery.Selection) {
+		markdownContent.WriteString("\n")
+		ul.Find("li").Each(func(_ int, li *goquery.Selection) {
+			markdownContent.WriteString("* " + strings.TrimSpace(li.Text()) + "\n")
+		})
+		markdownContent.WriteString("\n")
+	})
+
+	selection.Find("ol").Each(func(_ int, ol *goquery.Selection) {
+		markdownContent.WriteString("\n")
+		ol.Find("li").Each(func(i int, li *goquery.Selection) {
+			markdownContent.WriteString(fmt.Sprintf("%d. %s\n", i+1, strings.TrimSpace(li.Text())))
+		})
+		markdownContent.WriteString("\n")
+	})
+
+	// Code Blocks
+	selection.Find("pre code").Each(func(_ int, code *goquery.Selection) {
+		languageClass := ""
+		classes := strings.Fields(code.Parent().AttrOr("class", "")) // Get class from <pre>
+		for _, class := range classes {
+			if strings.HasPrefix(class, "language-") {
+				languageClass = strings.TrimPrefix(class, "language-")
+				break
+			}
+		}
+		codeText := strings.TrimSpace(code.Text())
+		if languageClass != "" {
+			markdownContent.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", languageClass, codeText))
+		} else {
+			markdownContent.WriteString(fmt.Sprintf("```\n%s\n```\n\n", codeText))
+		}
+	})
+	selection.Find("code").Each(func(_ int, code *goquery.Selection) { // Inline code
+		parentTag := goquery.NodeName(code.Parent())
+		if parentTag != "pre" { // Avoid double rendering of code blocks already handled above
+			markdownContent.WriteString(fmt.Sprintf("`%s`", strings.TrimSpace(code.Text())))
+		}
+	})
+
+	// Blockquotes
+	selection.Find("blockquote").Each(func(_ int, blockquote *goquery.Selection) {
+		markdownContent.WriteString("> " + strings.TrimSpace(blockquote.Text()) + "\n\n")
+	})
+
+	// Tables
+	selection.Find("table").Each(func(_ int, table *goquery.Selection) {
+		markdownContent.WriteString("\n") // Add a newline before the table
+
+		headerRow := table.Find("thead tr").First() // Get the first header row
+		if headerRow.Length() > 0 {
+			markdownContent.WriteString("|")
+			headerRow.Find("th").Each(func(_ int, th *goquery.Selection) {
+				markdownContent.WriteString(strings.TrimSpace(th.Text()) + "|")
+			})
+			markdownContent.WriteString("\n|")
+			headerRow.Find("th").Each(func(_ int, _ *goquery.Selection) {
+				markdownContent.WriteString("---|") // Separator row
+			})
+			markdownContent.WriteString("\n")
+		}
+
+		table.Find("tbody tr").Each(func(_ int, row *goquery.Selection) {
+			markdownContent.WriteString("|")
+			row.Find("td").Each(func(_ int, td *goquery.Selection) {
+				markdownContent.WriteString(strings.TrimSpace(td.Text()) + "|")
+			})
+			markdownContent.WriteString("\n")
+		})
+		markdownContent.WriteString("\n") // Add a newline after the table
+	})
+
+	selection.Find(".card-body").Each(func(_ int, cardBody *goquery.Selection) { // Keep card-body section
 		cardBody.Find("h2.card-title a").Each(func(_ int, titleLink *goquery.Selection) {
 			title := strings.TrimSpace(titleLink.Text())
 			link, _ := titleLink.Attr("href")
@@ -279,13 +417,6 @@ func generateMarkdown(selection *goquery.Selection, baseURL string, config Crawl
 			description := strings.TrimSpace(desc.Text())
 			markdownContent.WriteString(description + "\n\n")
 		})
-	})
-
-	selection.Find("p").Each(func(_ int, p *goquery.Selection) {
-		paragraphText := strings.TrimSpace(p.Text())
-		if paragraphText != "" {
-			markdownContent.WriteString(paragraphText + "\n\n")
-		}
 	})
 
 	selection.Find("img").Each(func(_ int, img *goquery.Selection) {
@@ -299,6 +430,14 @@ func generateMarkdown(selection *goquery.Selection, baseURL string, config Crawl
 
 	selection.Find("picture source").Each(func(_ int, source *goquery.Selection) {
 		if srcset, srcsetExists := source.Attr("srcset"); srcsetExists {
+			srcsetURLs := parseSrcset(srcset)
+			for _, srcsetURL := range srcsetURLs {
+				markdownContent.WriteString(fmt.Sprintf("[Image Link](%s)\n\n", resolveURL(baseURL, srcsetURL)))
+			}
+		}
+	})
+	selection.Find("img[srcset]").Each(func(_ int, img *goquery.Selection) { // Handle srcset on img tags directly
+		if srcset, srcsetExists := img.Attr("srcset"); srcsetExists {
 			srcsetURLs := parseSrcset(srcset)
 			for _, srcsetURL := range srcsetURLs {
 				markdownContent.WriteString(fmt.Sprintf("[Image Link](%s)\n\n", resolveURL(baseURL, srcsetURL)))
@@ -336,6 +475,7 @@ func generateMarkdown(selection *goquery.Selection, baseURL string, config Crawl
 
 	return markdownContent.String(), references
 }
+
 
 // Helper function to parse srcset attribute
 func parseSrcset(srcset string) []string {
@@ -417,8 +557,7 @@ func main() {
 		}
 
 		c.Set("Content-Type", "text/markdown")
-		c.Set("Content-Disposition", "inline; filename=\"crawled_content.md\"")
-
+		// c.Set("Content-Disposition", "inline; filename=\"crawled_content.md\"") // Removed Content-Disposition
 		return c.SendString(data.Markdown)
 	})
 
