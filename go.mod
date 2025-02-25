@@ -1,4 +1,4 @@
-module rag-crawler
+module github.com/h2210316651/lexicrawler
 
 go 1.23
 
